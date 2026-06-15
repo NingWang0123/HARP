@@ -119,6 +119,16 @@ harp/
 
 ---
 
+## Tests
+
+A tiny CPU-only smoke test (no GPU, no model download, no data files) covers the
+import + public API, the `harp()` entry point, the HARP-C / HARP-E selection
+semantics, and the Stage-1a hierarchy:
+
+```bash
+python tests/test_smoke.py        # or: pytest tests/test_smoke.py
+```
+
 ## Citation
 
 ```bibtex
