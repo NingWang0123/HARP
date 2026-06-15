@@ -1,0 +1,16 @@
+# HARP core dependencies. Pins in comments are the versions HARP was tested with.
+numpy>=1.26           # tested: 2.2.6
+torch>=2.2            # tested: 2.10.0
+transformers>=4.45    # tested: 4.57.6
+peft>=0.12            # tested: 0.15.2
+scikit-learn>=1.3     # tested: 1.8.0
+tqdm>=4.66
+
+# ---- Optional ----
+# Fast approximate-nearest-neighbour leaf grouping. Without it, HARP falls back
+# to scikit-learn KMeans (already required above).
+#   faiss-gpu      # or: faiss-cpu
+#
+# Fast batched inner-eval during the Stage-1b bootstrap (otherwise a plain
+# HuggingFace generate/eval path is used).
+#   vllm>=0.6      # tested: 0.17.1

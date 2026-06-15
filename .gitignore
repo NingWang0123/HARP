@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+.DS_Store
+.venv/
+venv/
+env/
+
+# HARP runtime artifacts / inputs
+workspace/
+*.npy
+representatives.jsonl
+*.jsonl
+checkpoints/
+outputs/
+logs/
+slurm_logs/
+*.out
+*.err
