@@ -27,8 +27,8 @@ and `b_d` is the null (base-model) score for domain `d`:
 
 Both envelopes are optimized greedily and cut with the **best-prefix** rule:
 rank leaves by greedy marginal gain, then keep the prefix that maximizes the
-cumulative gain (`argmax` of the running sum). HARP-E's point selection is
-additionally capped at the point budget `TOP_K_POINTS`.
+cumulative gain (`argmax` of the running sum). Both point selections are then
+capped at the budget `TOP_K_POINTS`.
 
 ### Pipeline
 
@@ -100,7 +100,7 @@ info       = result.info     # diagnostics: phi, task filtering, leaf orders, cu
 
 | Field | Description |
 | ----- | ----------- |
-| `harp_c` | `np.ndarray[int]` of selected train-example indices under HARP-C (best-prefix cut, uncapped). |
+| `harp_c` | `np.ndarray[int]` of selected train-example indices under HARP-C (best-prefix cut, capped at `TOP_K_POINTS`). |
 | `harp_e` | `np.ndarray[int]` of selected train-example indices under HARP-E (best-prefix cut, capped at `TOP_K_POINTS`). |
 | `info` | Diagnostics: per-task main effects `phi`, active-task filtering, full conservative/expansive leaf orders, cut indices, and the bootstrap summary. The per-envelope selections are also under `info["harp_c"]` / `info["harp_e"]`. |
 

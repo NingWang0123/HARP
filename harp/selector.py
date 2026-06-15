@@ -2264,10 +2264,11 @@ class HarpResult:
 
     Attributes:
         harp_c: 1-D int array of selected training-example indices under the
-            HARP-C (conservative) envelope, best-prefix cut.
+            HARP-C (conservative) envelope, best-prefix cut, capped at the point
+            budget ``TOP_K_POINTS``.
         harp_e: 1-D int array of selected training-example indices under the
             HARP-E (expansive) envelope, best-prefix cut, capped at the point
-            budget ``TOP_K_POINTS``.
+            budget ``TOP_K_POINTS`` (same cap as HARP-C).
         info: diagnostics — per-task main effects (phi), task filtering, the
             full conservative / expansive leaf orders, cut indices, and the
             bootstrap summary.
@@ -2305,7 +2306,7 @@ def harp(
     prior_var: float = 0.01,
 
     # --- Selection ---
-    TOP_K_POINTS: int = 10000,           # point budget for the HARP-E cut
+    TOP_K_POINTS: int = 10000,           # point budget for the HARP-C / HARP-E cuts
     use_knee_stop: bool = True,
     task_weight_mode: str = "auto",      # "macro", "micro", or "auto"
     epsilon_task: float = 0.005,         # active-task filtering threshold
@@ -2341,7 +2342,7 @@ def harp(
 
     Both envelopes use the *best-prefix* cut: rank leaves by greedy marginal
     gain, then keep the prefix that maximises cumulative gain (``argmax`` of the
-    running sum). HARP-E's point selection is additionally capped at
+    running sum). Both point selections are then capped at the budget
     ``TOP_K_POINTS``.
 
     This implements the first-order method from the paper: per-task main effects
@@ -2355,7 +2356,7 @@ def harp(
         eval_indices / eval_indices_path: proxy eval-set indices, or a path to a
             ``.npy`` of them (defaults to ``eval_indices_<metric>.npy``).
         v0: base-model utility; if ``None`` it is read from ``representatives_path``.
-        TOP_K_POINTS: point budget applied to the HARP-E selection.
+        TOP_K_POINTS: point budget applied to both selections.
         representatives_path: JSONL with per-subject base-model scores (``acc01``)
             used for the null scores ``b_d`` and the task grouping.
         hierarchy_csv_path: where to dump cluster sizes (diagnostic; ``None`` to skip).
@@ -2642,11 +2643,21 @@ def harp(
                 cut = int(fallback)
             return int(min(cut, int(n_leaves)))
 
-        # --- HARP-C: conservative envelope, best-prefix cut (uncapped) ---
+        def _select_points(leaf_order: np.ndarray) -> np.ndarray:
+            # Expand leaves to unique point ids, then apply the point budget.
+            # On dense pools argmax-cumsum can pick a prefix above the budget;
+            # truncate the tail, preserving leaf order. Applied symmetrically to
+            # HARP-C and HARP-E.
+            pts = _leaves_to_points(leaf_order)
+            if int(TOP_K_POINTS) > 0 and pts.size > int(TOP_K_POINTS):
+                pts = pts[: int(TOP_K_POINTS)]
+            return pts
+
+        # --- HARP-C: conservative envelope, best-prefix cut (capped at TOP_K_POINTS) ---
         s0_gains = np.asarray(S0_info.get("gains", []), dtype=float)
         c_cut = _best_prefix_cut(s0_gains, S0_leaf.size, S0_cutoff)
         harp_c_leaves = S0_leaf[:c_cut]
-        harp_c_points = _leaves_to_points(harp_c_leaves)
+        harp_c_points = _select_points(harp_c_leaves)
         S0_info["best_prefix_leaf_cutoff_idx"] = int(c_cut)
         S0_info["best_prefix_point_cutoff_idx"] = int(harp_c_points.size)
         S0_info["best_prefix_leaves"] = harp_c_leaves.tolist()
@@ -2658,11 +2669,7 @@ def harp(
         splus_gains = np.asarray(Splus_info.get("gains", []), dtype=float)
         e_cut = _best_prefix_cut(splus_gains, Splus_leaf.size, Splus_cutoff)
         harp_e_leaves = Splus_leaf[:e_cut]
-        harp_e_points = _leaves_to_points(harp_e_leaves)
-        # Point-level budget cap: on dense pools argmax-cumsum can pick a prefix
-        # above the budget; truncate the tail, preserving leaf order.
-        if int(TOP_K_POINTS) > 0 and harp_e_points.size > int(TOP_K_POINTS):
-            harp_e_points = harp_e_points[: int(TOP_K_POINTS)]
+        harp_e_points = _select_points(harp_e_leaves)
         Splus_info["best_prefix_leaf_cutoff_idx"] = int(e_cut)
         Splus_info["best_prefix_point_cutoff_idx"] = int(harp_e_points.size)
         Splus_info["best_prefix_leaves"] = harp_e_leaves.tolist()
