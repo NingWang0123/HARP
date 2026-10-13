@@ -427,7 +427,7 @@ def parallel_train_then_batch_eval(
     # Eval phase
     eval_dl = gpu_pool.eval_arrays  # actually we need the DataLoader, see below
     # Actually the eval DL lives in worker _G, not on gpu_pool. We need to
-    # reconstruct it in the main process. Store eval_arrays + eval_indices on
+    # reconstruct it in the main process from all rows of eval_arrays on
     # gpu_pool init so we can rebuild here.
     raise NotImplementedError(
         "parallel_train_then_batch_eval: eval_dl reconstruction in main process not yet wired. "

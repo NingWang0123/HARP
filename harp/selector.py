@@ -38,12 +38,16 @@ def _stage1b_ckpt_path(checkpoint_dir: str, level: str) -> str:
 
 
 def _stage1b_ckpt_key(*, leaf_groups, bootstrap_seed_int, eval_metric,
-                      base_model_name, n_train, n_eval) -> str:
-    """Deterministic key for Stage 1b cache. Captures everything the bootstrap
-    + pair measurements depend on; if any of these change the cache is invalid."""
+                      base_model_name, n_train, n_eval, validation_fingerprint) -> str:
+    """Versioned Stage-1b key including the complete fixed validation identity.
+
+    Legacy proxy-subset checkpoints and changed validation/baseline inputs
+    cannot reuse measurements from the earlier protocol.
+    """
     sizes = "+".join(str(int(len(g))) for g in leaf_groups)
-    raw = f"G={len(leaf_groups)}|sizes={sizes}|seed={bootstrap_seed_int}" \
-          f"|metric={eval_metric}|model={base_model_name}|n_train={n_train}|n_eval={n_eval}"
+    raw = f"full-validation-v1|G={len(leaf_groups)}|sizes={sizes}|seed={bootstrap_seed_int}" \
+          f"|metric={eval_metric}|model={base_model_name}|n_train={n_train}|n_eval={n_eval}" \
+          f"|validation={validation_fingerprint}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -182,7 +186,7 @@ def precompute_dataset_arrays(
     for ex in examples:
         prompt = ex.get("input", "")
         target = ex.get("target", "")
-        subject = ex.get("subject", "")
+        subject = str(ex.get("subject", "") or "").strip()
         
         if subject not in subject_map:
             subject_map[subject] = len(subject_map)
@@ -325,6 +329,68 @@ class CachedTensorDataset(Dataset):
         }
 
 
+def _full_validation_loader(data_arrays: Dict[str, np.ndarray], batch_size: int):
+    """Score every supplied validation row once, in the same fixed order."""
+    n_eval = len(data_arrays["input_ids"])
+    if n_eval == 0:
+        raise ValueError("HARP requires a nonempty fixed validation set.")
+    dataset = CachedTensorDataset(np.arange(n_eval, dtype=int), data_arrays)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+def _validate_validation_split(train_examples, eval_examples):
+    if not eval_examples:
+        raise ValueError("HARP requires a nonempty fixed validation set.")
+    train_objects = {id(row) for row in train_examples}
+    if any(id(row) in train_objects for row in eval_examples):
+        raise ValueError(
+            "Training and validation examples must be disjoint; shared example "
+            "objects were supplied. Remove held-out validation rows from the training pool."
+        )
+
+
+def _validate_full_validation_baseline(eval_examples, subject_to_task, v0_per_task,
+                                       task_counts):
+    """Require one baseline score per full validation row, in matching domains."""
+    expected = defaultdict(int)
+    for row in eval_examples:
+        subject = str(row.get("subject", "") or "").strip()
+        if subject not in subject_to_task:
+            raise ValueError(f"Baseline scores are missing validation subject {subject!r}.")
+        expected[subject_to_task[subject]] += 1
+    expected = dict(expected)
+    if set(v0_per_task) != set(expected) or task_counts != expected:
+        raise ValueError(
+            "Baseline scores must cover the same full validation domains and row counts: "
+            f"expected {expected}, got {task_counts}. Regenerate representatives_path "
+            "with one base-model score per validation example; proxy subsets and "
+            "one-row-per-domain summaries are not accepted."
+        )
+    if any(not math.isfinite(score) or not 0.0 <= score <= 1.0
+           for score in v0_per_task.values()):
+        raise ValueError("Full-validation baseline scores must be finite values in [0, 1].")
+    return expected
+
+
+def _validation_fingerprint(eval_arrays, subj_id_to_task, v0_per_task, eval_examples):
+    """Identify fixed validation content/order, domains, scoring metadata and baselines."""
+    digest = hashlib.sha256()
+    for name in _DATA_ARRAY_KEYS:
+        array = np.ascontiguousarray(eval_arrays[name])
+        digest.update(json.dumps([name, str(array.dtype), array.shape]).encode("utf-8"))
+        digest.update(array.tobytes())
+    metadata = {
+        "validation_rows": eval_examples,
+        "task_types": eval_arrays.get("_task_types", []),
+        "gold_strings": eval_arrays.get("_gold_strings", []),
+        "subject_map": eval_arrays.get("_subject_map", {}),
+        "domain_mapping": subj_id_to_task,
+        "baseline_scores": v0_per_task,
+    }
+    digest.update(json.dumps(metadata, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    return digest.hexdigest()
+
+
 # ============================================================
 # math utilities
 # ============================================================
@@ -431,7 +497,7 @@ def _eval_accuracy_per_task(model, device, eval_dl) -> Dict[int, float]:
     else:
         primary_tt = "multi_choice"
 
-    # Match Stage 3 vLLM eval budgets so the Shapley proxy is predictive
+    # Match Stage 3 vLLM generation budgets so validation utility is predictive
     # of final accuracy. Mismatched token caps were a real bug — small
     # caps truncated CoT-trained models before they emitted the answer letter.
     if primary_tt in ("numeric", "latex_boxed"):
@@ -527,7 +593,6 @@ def _init_worker_process(
     gpu_queue,
     base_model_name: str,
     data_tmpdir: str,
-    eval_indices: np.ndarray,
     lora_hparams: Dict[str, Any],
     num_gpus: int,
     verbose: bool,
@@ -641,11 +706,9 @@ def _init_worker_process(
         _G["train_task_types"] = list(train_data_arrays.get("_task_types", []))
         _G["train_gold_strings"] = list(train_data_arrays.get("_gold_strings", []))
 
-        eval_indices = np.asarray(eval_indices, dtype=int)
-        eval_ds = CachedTensorDataset(eval_indices, eval_data_arrays)
         eval_bs = int(_G["lora_hparams"].get("eval_batch_size",
                                               os.environ.get("HARP_EVAL_BS", 64)))
-        _G["eval_dl"] = DataLoader(eval_ds, batch_size=eval_bs, shuffle=False)
+        _G["eval_dl"] = _full_validation_loader(eval_data_arrays, eval_bs)
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -804,12 +867,12 @@ class GPUWorkerPool:
         train_examples: List[Dict],
         eval_examples: List[Dict],
         *,
-        eval_indices: Optional[np.ndarray] = None,
         num_gpus: Optional[int] = None,
         lora_config: Optional[Dict] = None,
         verbose: bool = True,
         eval_metric: str = "loss",
     ):
+        _validate_validation_split(train_examples, eval_examples)
         self.base_model_name = base_model_name
         self.verbose = bool(verbose)
         self.lora_config = dict(lora_config or {})
@@ -873,16 +936,6 @@ class GPUWorkerPool:
         if self.verbose:
             print(f"[GPUWorkerPool] Data arrays saved to {self._data_tmpdir}")
 
-        eval_n = len(eval_arrays["input_ids"])
-
-        if eval_indices is None:
-            seed = int(self.lora_config.get("eval_seed", 0))
-            rng = np.random.default_rng(seed)
-            eval_indices = rng.choice(eval_n, size=eval_n, replace=False)
-        else:
-            eval_indices = np.asarray(eval_indices, dtype=int)
-
-        self.eval_indices = np.asarray(eval_indices, dtype=int)
         self.base_model_name = base_model_name
         # Stash tokenizer_gen for main-process eval_dl reconstruction (used by
         # the vLLM-batched inner-eval path; harmless otherwise).
@@ -901,7 +954,6 @@ class GPUWorkerPool:
                 self.gpu_queue,
                 self.base_model_name,
                 self._data_tmpdir,
-                self.eval_indices,
                 self.lora_config,
                 self.num_gpus,
                 self.verbose,
@@ -1017,10 +1069,9 @@ class GPUWorkerPool:
             print(f"[GPUWorkerPool/vllm] Worker release warning: {e}")
 
         # 3. EVAL PHASE — reconstruct eval_dl in main process, run vLLM batch eval
-        eval_ds = CachedTensorDataset(self.eval_indices, self.eval_arrays)
         eval_bs = int(self.lora_config.get("eval_batch_size",
                                            os.environ.get("HARP_EVAL_BS", 64)))
-        eval_dl = DataLoader(eval_ds, batch_size=eval_bs, shuffle=False)
+        eval_dl = _full_validation_loader(self.eval_arrays, eval_bs)
 
         eval_task_types = list(self.eval_arrays.get("_task_types", []) or [])
         eval_gold_strings = list(self.eval_arrays.get("_gold_strings", []) or [])
@@ -1777,12 +1828,12 @@ def load_task_grouping_from_representatives(
     score_key: str = "acc01",
 ) -> Tuple[Dict[str, str], Dict[str, float], Dict[str, int], bool]:
     """
-    Read representatives.jsonl to determine task grouping and per-task null scores.
+    Read full-validation baseline scores to determine domains and null scores.
     
     Returns:
         subject_to_task: mapping from subject_name -> task_group_name
         v0_per_task: Dict[task_group_name, mean_null_score] for each task
-        task_counts: Dict[task_group_name, n_representatives] for micro weighting
+        task_counts: Dict[task_group_name, n_validation_rows] for micro weighting
         use_subject: True if grouping by subject, False if by embedding bucket
     """
     rows = []
@@ -2094,7 +2145,7 @@ def filter_active_tasks_and_weights(
         # equal weight per task (macro accuracy)
         w_t = np.ones(len(active_tasks), dtype=np.float64) / len(active_tasks)
     elif task_weight_mode == "micro":
-        # weight proportional to # representatives in each task
+        # weight proportional to the full validation row count in each task
         counts = np.array([task_counts.get(t, 1) for t in active_tasks], dtype=np.float64)
         w_sum = counts.sum()
         w_t = counts / w_sum if w_sum > 0 else np.ones(len(active_tasks)) / len(active_tasks)
@@ -2286,7 +2337,6 @@ def harp(
     *,
     tokenizer,
     num_gpus: Optional[int] = None,
-    eval_indices: Optional[np.ndarray] = None,
     eval_metric: str = "accuracy",
     rng: np.random.Generator = np.random.default_rng(0),
     lora_config: Optional[Dict[str, Any]] = None,
@@ -2313,7 +2363,6 @@ def harp(
 
     # --- Inputs / artifacts ---
     representatives_path: str = "representatives.jsonl",
-    eval_indices_path: Optional[str] = None,    # default: eval_indices_<metric>.npy
     hierarchy_csv_path: Optional[str] = "workspace/hierarchy_cluster_sizes.csv",
 
     # --- Stage-1b checkpointing (pass a dir to enable resume-on-preempt) ---
@@ -2351,14 +2400,16 @@ def harp(
     Args:
         X_feat: (n, d) L2-normalisable feature matrix, one row per train example.
         base_model_name: HF model id finetuned on each representative leaf.
-        train_examples / eval_examples: tokenised train pool and proxy eval set.
+        train_examples / eval_examples: SFT rows (input, target, subject) for the
+            training pool and the complete fixed held-out validation set. Every
+            validation row is scored for every measured model; final test data
+            must not be supplied for selection.
         tokenizer: HF tokenizer for ``base_model_name``.
-        eval_indices / eval_indices_path: proxy eval-set indices, or a path to a
-            ``.npy`` of them (defaults to ``eval_indices_<metric>.npy``).
         v0: base-model utility; if ``None`` it is read from ``representatives_path``.
         TOP_K_POINTS: point budget applied to both selections.
-        representatives_path: JSONL with per-subject base-model scores (``acc01``)
-            used for the null scores ``b_d`` and the task grouping.
+        representatives_path: JSONL containing one base-model score (``acc01``)
+            for every row in the same full validation set, with matching subject
+            labels, used for the null scores ``b_d`` and the task grouping.
         hierarchy_csv_path: where to dump cluster sizes (diagnostic; ``None`` to skip).
         checkpoint_dir: enable Stage-1b resume-on-preempt when set.
 
@@ -2375,16 +2426,11 @@ def harp(
             info={"error": "empty input"},
         )
 
+    _validate_validation_split(train_examples, eval_examples)
+
     X_feat = l2_normalize_cuda_if_available(X_feat)
     n = int(X_feat.shape[0])
     assert n == len(train_examples), "X_feat rows must match train_examples length."
-
-    if eval_indices is None:
-        if eval_indices_path is None:
-            eval_indices_path = f"eval_indices_{eval_metric}.npy"
-        eval_indices = np.load(eval_indices_path)
-    else:
-        eval_indices = np.asarray(eval_indices, dtype=int)
 
     rep_path = representatives_path
     if v0 is None:
@@ -2398,6 +2444,9 @@ def harp(
         rep_path,
         subject_key="subject",
         score_key="acc01",
+    )
+    task_counts = _validate_full_validation_baseline(
+        eval_examples, subject_to_task, v0_per_task, task_counts,
     )
 
     print(f"[per-task] use_subject={use_subject_grouping}, n_tasks={len(v0_per_task)}")
@@ -2450,6 +2499,8 @@ def harp(
         "leaf_max_group_size": int(leaf_max_group_size),
         "rep_per_parent": int(rep_per_parent),
         "eval_metric": str(eval_metric),
+        "validation_protocol": "full_fixed",
+        "n_validation": int(len(eval_examples)),
     }
 
     if G == 0:
@@ -2466,7 +2517,6 @@ def harp(
         base_model_name=base_model_name,
         train_examples=train_examples,
         eval_examples=eval_examples,
-        eval_indices=eval_indices,
         num_gpus=num_gpus,
         lora_config=lora_config,
         verbose=bool(lora_config.get("verbose", True)),
@@ -2504,6 +2554,9 @@ def harp(
             base_model_name=str(base_model_name),
             n_train=int(len(train_examples)),
             n_eval=int(len(eval_examples)),
+            validation_fingerprint=_validation_fingerprint(
+                gpu_pool.eval_arrays, subj_id_to_task, v0_per_task, eval_examples,
+            ),
         )
         # Try CKPT-B first (covers the most ground); fall back to CKPT-A.
         _ckpt_b = _try_load_stage1b_ckpt(checkpoint_dir, "B", ckpt_key)
