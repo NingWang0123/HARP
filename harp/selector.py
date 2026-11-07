@@ -38,17 +38,26 @@ def _stage1b_ckpt_path(checkpoint_dir: str, level: str) -> str:
 
 
 def _stage1b_ckpt_key(*, leaf_groups, bootstrap_seed_int, eval_metric,
-                      base_model_name, n_train, n_eval, validation_fingerprint) -> str:
-    """Versioned Stage-1b key including the complete fixed validation identity.
-
-    Legacy proxy-subset checkpoints and changed validation/baseline inputs
-    cannot reuse measurements from the earlier protocol.
-    """
-    sizes = "+".join(str(int(len(g))) for g in leaf_groups)
-    raw = f"full-validation-v1|G={len(leaf_groups)}|sizes={sizes}|seed={bootstrap_seed_int}" \
-          f"|metric={eval_metric}|model={base_model_name}|n_train={n_train}|n_eval={n_eval}" \
-          f"|validation={validation_fingerprint}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+                      base_model_name, n_train, n_eval, validation_fingerprint,
+                      leaf_feat, parent_of_leaf, rep_per_parent,
+                      interpolation_temperature, use_eb_shrinkage, prior_var,
+                      se_floor) -> str:
+    """Invalidate old parent-broadcast estimates and changed interpolation inputs."""
+    metadata = {
+        "protocol": "full-validation-cosine-interpolation-v2",
+        "seed": int(bootstrap_seed_int), "metric": str(eval_metric),
+        "model": str(base_model_name), "n_train": int(n_train), "n_eval": int(n_eval),
+        "validation": validation_fingerprint, "rep_per_parent": int(rep_per_parent),
+        "interpolation_temperature": float(interpolation_temperature),
+        "use_eb_shrinkage": bool(use_eb_shrinkage),
+        "prior_var": float(prior_var), "se_floor": float(se_floor),
+    }
+    digest = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode("utf-8"))
+    for value in [*leaf_groups, parent_of_leaf, leaf_feat]:
+        array = np.ascontiguousarray(value)
+        digest.update(json.dumps([str(array.dtype), array.shape]).encode("utf-8"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()[:16]
 
 
 def _save_stage1b_ckpt(checkpoint_dir: Optional[str], level: str, key: str,
@@ -83,8 +92,8 @@ def _try_load_stage1b_ckpt(checkpoint_dir: Optional[str], level: str,
     rejected if measured_leaf_frac falls below it.
 
     Default 0.10 reflects empirical reality: a healthy bootstrap with
-    rep_per_parent=3 covers ~36-42% of total leaves (the rest inherit the
-    parent's gain). 50% would reject every legitimate run. The poisoned
+    rep_per_parent=3 covers ~36-42% of total leaves (the rest interpolate
+    their parent's representatives). 50% would reject every legitimate run. The poisoned
     OOM cache from earlier (618699 / 620669) had ~5% of leaves measured,
     so 0.10 catches it cleanly while letting real runs through.
     """
@@ -1176,6 +1185,42 @@ def estimate_group_independent_phi_per_task_parallel(
 
 
 
+def _validate_interpolation_config(temperature, prior_var, se_floor):
+    for name, value in [("interpolation_temperature", temperature),
+                        ("prior_var", prior_var), ("se_floor", se_floor)]:
+        if not np.isfinite(value) or float(value) <= 0:
+            raise ValueError(f"{name} must be finite and strictly positive.")
+
+
+def _cosine_interpolation_weights(query_features, representative_features, *, temperature):
+    """Paper §3.3 kernel, with ν(0)=0 and a stable softmax for any positive λ."""
+    _validate_interpolation_config(temperature, 0.01, 1e-3)
+
+    def unit_rows(features):
+        features = np.asarray(features, dtype=np.float64)
+        if features.ndim != 2 or features.shape[1] == 0 or not np.isfinite(features).all():
+            raise ValueError("Leaf embeddings must be a finite two-dimensional matrix.")
+        # Scale before computing norms to avoid overflow/underflow on finite inputs.
+        scale = np.max(np.abs(features), axis=1, keepdims=True)
+        scaled = np.divide(features, scale, out=np.zeros_like(features), where=scale > 0)
+        norm = np.linalg.norm(scaled, axis=1, keepdims=True)
+        return np.divide(scaled, norm, out=np.zeros_like(scaled), where=norm > 0)
+
+    query = unit_rows(query_features)
+    representatives = unit_rows(representative_features)
+    if representatives.shape[0] == 0:
+        raise ValueError("Interpolation requires a measured representative in the same parent.")
+    if query.shape[1] != representatives.shape[1]:
+        raise ValueError("Leaf and representative embedding dimensions must agree.")
+    similarity = np.clip(query @ representatives.T, -1.0, 1.0)
+    # Subtract before dividing: cos/λ itself may overflow for very small λ.
+    with np.errstate(over="ignore", under="ignore"):
+        weights = np.exp((similarity - similarity.max(axis=1, keepdims=True)) / temperature)
+    weights /= weights.sum(axis=1, keepdims=True)
+    n_eff = np.clip(1.0 / np.sum(weights ** 2, axis=1), 1.0, representatives.shape[0])
+    return weights, n_eff
+
+
 def bootstrap_parent_representative_independent_per_task(
     gpu_pool: "GPUWorkerPool",
     *,
@@ -1184,319 +1229,145 @@ def bootstrap_parent_representative_independent_per_task(
     parent_of_leaf: np.ndarray,
     group_of_i: np.ndarray,
     eval_metric: str,
-    v0_per_task: Dict[str, float],           # {task_name: null_score}
-    subj_id_to_task: Dict[int, str],         # {int_subj_id: task_name}
+    v0_per_task: Dict[str, float],
+    subj_id_to_task: Dict[int, str],
     rep_per_parent: int = 2,
     seed_int: int = 0,
     rng: np.random.Generator = np.random.default_rng(0),
     se_floor: float = 1e-3,
     use_eb_shrinkage: bool = True,
     prior_var: float = 0.01,
+    interpolation_temperature: float = 1.0,
 ) -> Tuple[
-    np.ndarray, np.ndarray,   # mu_leaf (macro), se_leaf (macro)
-    Dict[int, Dict[str, float]],  # mu_leaf_per_task: {gid: {task: phi}}
-    Dict[int, Dict[str, float]],  # se_leaf_per_task: {gid: {task: se}}
-    np.ndarray,               # leaf_is_measured
-    Dict[str, Any],           # info
+    np.ndarray, np.ndarray,
+    Dict[int, Dict[str, float]], Dict[int, Dict[str, float]],
+    np.ndarray, Dict[str, Any],
 ]:
+    """Measure representatives, then interpolate and shrink each unmeasured leaf.
+
+    Within its parent, α=softmax(cos/λ), ỹ=Σαy and n_eff=1/Σα².
+    Per-domain observation variance is σ²_parent/n_eff; the posterior mean is
+    ρỹ+(1-ρ)μ₀ with ρ=prior_var/(prior_var+observation_variance).
+    μ₀ averages all measured effects (not parent means). As in the paper's
+    hyperparameter table, prior_var supplies τ² (default 0.01). Within-parent
+    sample variance is floored at se_floor²; a single representative uses the
+    pooled within-parent variance, or the floor when no variance is estimable.
+    Directly measured leaves retain their observed effects without shrinkage.
     """
-    Per-task bootstrap: same as bootstrap_parent_representative_independent but
-    computes phi decomposed per task.
-    
-    Key output: mu_leaf_per_task[gid][task_name] = phi for that task
-    The macro phi = mean(mu_leaf_per_task[gid].values()) for each gid
-    
-    Also returns mu_leaf (macro scalar per leaf) and se_leaf for backward compatibility
-    with the interaction stage.
-    """
-    leaf_feat = np.asarray(leaf_feat, dtype=np.float32)
+    _validate_interpolation_config(interpolation_temperature, prior_var, se_floor)
+    leaf_feat = np.asarray(leaf_feat, dtype=np.float64)
     parent_of_leaf = np.asarray(parent_of_leaf, dtype=int)
     group_of_i = np.asarray(group_of_i, dtype=int)
-
-    n = int(group_of_i.size)
-    G = int(len(leaf_groups))
-    task_names = sorted(v0_per_task.keys())
-    n_tasks = len(task_names)
-    
-    if G == 0 or n == 0:
-        return (
-            np.zeros(G, dtype=float),
-            np.full(G, np.inf, dtype=float),
-            {}, {},
-            np.zeros(G, dtype=bool),
-            {"error": "empty groups"},
-        )
-
-    P = int(parent_of_leaf.max()) + 1 if parent_of_leaf.size else 0
-
-    # 1) Representative sampling (same as original)
+    G = len(leaf_groups)
+    task_names = sorted(v0_per_task)
+    if G == 0 or group_of_i.size == 0:
+        return (np.zeros(G), np.full(G, np.inf), {}, {}, np.zeros(G, dtype=bool),
+                {"error": "empty groups"})
+    if (leaf_feat.ndim != 2 or leaf_feat.shape[0] != G or leaf_feat.shape[1] == 0
+            or not np.isfinite(leaf_feat).all()):
+        raise ValueError("leaf_feat must contain one finite embedding per leaf.")
+    if parent_of_leaf.shape != (G,) or np.any(parent_of_leaf < 0) or not task_names:
+        raise ValueError("Each leaf needs a valid parent and nonempty validation domains.")
+    P = int(parent_of_leaf.max()) + 1
     reps_per_parent, rep_leaf_gids = sample_representative_leaf_groups(
-        leaf_groups,
-        leaf_feat,
-        parent_of_leaf,
-        rep_per_parent=int(rep_per_parent),
-        rng=rng,
-        use_diverse=True,
+        leaf_groups, leaf_feat, parent_of_leaf,
+        rep_per_parent=int(rep_per_parent), rng=rng, use_diverse=True,
     )
-
-    # 2) Per-task independent φ for rep leaf groups
-    player_sets = {int(gid): np.asarray(leaf_groups[int(gid)], dtype=int)
-                   for gid in rep_leaf_gids.tolist()}
-    
     phi_per_task_map = estimate_group_independent_phi_per_task_parallel(
         player_ids=rep_leaf_gids,
-        player_sets=player_sets,
-        gpu_pool=gpu_pool,
-        eval_metric=eval_metric,
-        v0_per_task=v0_per_task,
-        subj_id_to_task=subj_id_to_task,
-        seed_int=int(seed_int),
+        player_sets={int(g): np.asarray(leaf_groups[int(g)], dtype=int)
+                     for g in rep_leaf_gids.tolist()},
+        gpu_pool=gpu_pool, eval_metric=eval_metric, v0_per_task=v0_per_task,
+        subj_id_to_task=subj_id_to_task, seed_int=int(seed_int),
     )
 
-    # 3) Also compute macro phi for each rep (for backward compatibility / SE estimation)
-    phi_rep_map_macro: Dict[int, float] = {}
-    for gid, task_phis in phi_per_task_map.items():
-        if task_phis:
-            phi_rep_map_macro[int(gid)] = float(np.mean(list(task_phis.values())))
-        else:
-            phi_rep_map_macro[int(gid)] = 0.0
-
-    # 4) Aggregate to parent level (macro) for SE estimation, same as original
-    mu_parent = np.zeros(P, dtype=float)
-    se_parent = np.full(P, np.inf, dtype=float)
-    r_parent = np.zeros(P, dtype=int)
-    rep_vals_parent: List[np.ndarray] = []
-
-    for p in range(P):
-        reps = reps_per_parent[p] if p < len(reps_per_parent) else np.zeros((0,), dtype=int)
-        vals = []
-        for gid in reps.tolist():
-            if int(gid) in phi_rep_map_macro:
-                vals.append(float(phi_rep_map_macro[int(gid)]))
-        vals = np.asarray(vals, dtype=float)
-        rep_vals_parent.append(vals)
-        r = int(vals.size)
-        r_parent[p] = r
-
-        if r == 0:
-            mu_parent[p] = 0.0
-            se_parent[p] = np.inf
-        elif r == 1:
-            mu_parent[p] = float(vals[0])
-            se_parent[p] = np.inf
-        else:
-            mu_parent[p] = float(vals.mean())
-            cvar = float(vals.var(ddof=1))
-            se_parent[p] = float(max(se_floor, np.sqrt(cvar / r)))
-
-    # EB shrinkage on parent means — BOTH macro and per-task
-    # For macro: same as original
-    # For per-task: same EB model applied independently per task t
-    #   θₚ(t) ~ N(μ_global(t), τ²(t))
-    #   μ̂ₚ(t) | θₚ(t) ~ N(θₚ(t), σ²ₚ(t)/rₚ)
-    
-    # First collect per-task rep values per parent (needed for per-task variance)
-    rep_vals_parent_per_task: Dict[int, Dict[str, np.ndarray]] = {}
-    for p in range(P):
-        reps = reps_per_parent[p] if p < len(reps_per_parent) else np.zeros((0,), dtype=int)
-        task_vals: Dict[str, list] = {t: [] for t in task_names}
-        for gid in reps.tolist():
-            gid = int(gid)
-            if gid in phi_per_task_map:
-                for t, v in phi_per_task_map[gid].items():
-                    if t in task_vals:
-                        task_vals[t].append(v)
-        rep_vals_parent_per_task[p] = {t: np.asarray(vs, dtype=float) for t, vs in task_vals.items()}
-
-    # Raw per-task parent means (before shrinkage)
-    mu_parent_per_task_raw: Dict[int, Dict[str, float]] = {}
-    for p in range(P):
-        parent_tasks = {}
-        for t in task_names:
-            vals = rep_vals_parent_per_task[p][t]
-            if vals.size > 0:
-                parent_tasks[t] = float(vals.mean())
-            else:
-                parent_tasks[t] = 0.0
-        mu_parent_per_task_raw[p] = parent_tasks
-
-    if use_eb_shrinkage and P > 0:
-        good = (r_parent > 0)
-        
-        # --- Macro shrinkage (same as original) ---
-        global_mean = float(mu_parent[good].mean()) if np.any(good) else 0.0
-
-        num = 0.0
-        den = 0.0
-        for p in range(P):
-            r = int(r_parent[p])
-            if r >= 2:
-                vals = rep_vals_parent[p]
-                sp2 = float(vals.var(ddof=1))
-                if np.isfinite(sp2) and sp2 >= 0.0:
-                    num += (r - 1) * sp2
-                    den += (r - 1)
-
-        sigma2_within = float(num / den) if den > 0 else 0.0
-        sigma2_within = float(max(sigma2_within, se_floor**2))
-
-        for p in range(P):
-            r = int(r_parent[p])
-            if r <= 0:
-                mu_parent[p] = float(global_mean)
-                se_parent[p] = float(max(se_floor, np.sqrt(prior_var)))
-                continue
-
-            cmean = float(mu_parent[p])
-            if r >= 2:
-                vals = rep_vals_parent[p]
-                sp2 = float(vals.var(ddof=1))
-                if (not np.isfinite(sp2)) or sp2 < 0.0:
-                    sp2 = sigma2_within
-            else:
-                sp2 = sigma2_within
-
-            obs_var = float(max(sp2 / max(r, 1), se_floor**2))
-            post_mean, post_var = eb_shrinkage_from_obsvar(
-                cmean=cmean, obs_var=obs_var,
-                global_mean=global_mean, prior_var=float(prior_var),
-            )
-            mu_parent[p] = float(post_mean)
-            se_parent[p] = float(max(se_floor, np.sqrt(max(post_var, 0.0))))
-
-        # --- Per-task shrinkage: same EB model applied per task independently ---
-        # For each task t:
-        #   global_mean(t) = mean of μ̂ₚ(t) across parents with rₚ > 0
-        #   σ²_within(t) = pooled within-parent variance of φ(g,t) values
-        #   Then shrink each μ̂ₚ(t) toward global_mean(t)
-        
-        mu_parent_per_task: Dict[int, Dict[str, float]] = {}
-
-        for t in task_names:
-            # global mean for this task
-            task_parent_means = []
-            for p in range(P):
-                if r_parent[p] > 0:
-                    task_parent_means.append(mu_parent_per_task_raw[p][t])
-            global_mean_t = float(np.mean(task_parent_means)) if task_parent_means else 0.0
-
-            # pooled within-parent variance for this task
-            num_t = 0.0
-            den_t = 0.0
-            for p in range(P):
-                r = int(r_parent[p])
-                if r >= 2:
-                    vals_t = rep_vals_parent_per_task[p][t]
-                    if vals_t.size >= 2:
-                        sp2_t = float(vals_t.var(ddof=1))
-                        if np.isfinite(sp2_t) and sp2_t >= 0.0:
-                            num_t += (r - 1) * sp2_t
-                            den_t += (r - 1)
-
-            sigma2_within_t = float(num_t / den_t) if den_t > 0 else 0.0
-            sigma2_within_t = float(max(sigma2_within_t, se_floor**2))
-
-            # shrink each parent's per-task mean
-            for p in range(P):
-                if p not in mu_parent_per_task:
-                    mu_parent_per_task[p] = {}
-
-                r = int(r_parent[p])
-                if r <= 0:
-                    mu_parent_per_task[p][t] = float(global_mean_t)
-                    continue
-
-                cmean_t = mu_parent_per_task_raw[p][t]
-
-                if r >= 2:
-                    vals_t = rep_vals_parent_per_task[p][t]
-                    if vals_t.size >= 2:
-                        sp2_t = float(vals_t.var(ddof=1))
-                        if (not np.isfinite(sp2_t)) or sp2_t < 0.0:
-                            sp2_t = sigma2_within_t
-                    else:
-                        sp2_t = sigma2_within_t
-                else:
-                    sp2_t = sigma2_within_t
-
-                obs_var_t = float(max(sp2_t / max(r, 1), se_floor**2))
-                post_mean_t, _ = eb_shrinkage_from_obsvar(
-                    cmean=cmean_t, obs_var=obs_var_t,
-                    global_mean=global_mean_t, prior_var=float(prior_var),
+    # Complete within-parent evidence is required; do not invent zero effects
+    # or borrow another parent's representatives after an evaluation failure.
+    measured = np.zeros(G, dtype=bool)
+    values_by_parent = {}
+    for p in np.unique(parent_of_leaf):
+        reps = np.asarray(reps_per_parent[int(p)], dtype=int)
+        if (reps.size == 0 or np.any(reps < 0) or np.any(reps >= G)
+                or np.any(parent_of_leaf[reps] != p)):
+            raise RuntimeError(f"Parent {p} has no valid same-parent representatives.")
+        values = []
+        for gid in reps:
+            effects = phi_per_task_map.get(int(gid), {})
+            if any(t not in effects or not np.isfinite(effects[t]) for t in task_names):
+                raise RuntimeError(
+                    f"Representative leaf {gid} in parent {p} has incomplete or failed "
+                    "validation measurements; rerun before estimating unmeasured leaves."
                 )
-                mu_parent_per_task[p][t] = float(post_mean_t)
-    else:
-        # No shrinkage: use raw per-task parent means
-        mu_parent_per_task = dict(mu_parent_per_task_raw)
+            values.append([effects[t] for t in task_names])
+        values_by_parent[int(p)] = np.asarray(values, dtype=np.float64)
+        measured[reps] = True
 
-    # 5) Broadcast to leaf level
-    mu_leaf = np.zeros(G, dtype=float)
-    se_leaf = np.full(G, np.inf, dtype=float)
-    leaf_is_measured = np.zeros(G, dtype=bool)
+    all_values = np.concatenate(list(values_by_parent.values()), axis=0)
+    global_mean = all_values.mean(axis=0)
+    pooled_sum = np.zeros(len(task_names))
+    pooled_dof = 0
+    for values in values_by_parent.values():
+        if len(values) > 1:
+            pooled_sum += np.sum((values - values.mean(axis=0)) ** 2, axis=0)
+            pooled_dof += len(values) - 1
+    pooled_variance = np.maximum(pooled_sum / max(pooled_dof, 1), se_floor ** 2)
 
-    mu_leaf_per_task: Dict[int, Dict[str, float]] = {}
-    se_leaf_per_task: Dict[int, Dict[str, float]] = {}
-    
-    for gid in range(G):
-        pid = int(parent_of_leaf[gid])
-        mu_leaf[gid] = float(mu_parent[pid])
-        se_leaf[gid] = float(se_parent[pid])
-        mu_leaf_per_task[gid] = dict(mu_parent_per_task.get(pid, {}))
-        # SE per task: use parent SE for all tasks (conservative)
-        se_leaf_per_task[gid] = {t: float(se_parent[pid]) for t in task_names}
+    means = np.zeros((G, len(task_names)))
+    errors = np.zeros_like(means)
+    effective_counts = np.ones(G)
+    within_variances = {}
+    for p, values in values_by_parent.items():
+        reps = np.asarray(reps_per_parent[p], dtype=int)
+        members = np.flatnonzero(parent_of_leaf == p)
+        unmeasured = members[~measured[members]]
+        variance = (np.maximum(values.var(axis=0, ddof=1), se_floor ** 2)
+                    if len(values) > 1 else pooled_variance)
+        within_variances[p] = variance
+        if unmeasured.size:
+            weights, n_eff = _cosine_interpolation_weights(
+                leaf_feat[unmeasured], leaf_feat[reps],
+                temperature=interpolation_temperature,
+            )
+            local_mean = weights @ values
+            obs_var = variance[None, :] / n_eff[:, None]
+            if use_eb_shrinkage:
+                rho = prior_var / (prior_var + obs_var)
+                means[unmeasured] = rho * local_mean + (1.0 - rho) * global_mean
+                errors[unmeasured] = np.sqrt(rho * obs_var)
+            else:
+                means[unmeasured] = local_mean
+                errors[unmeasured] = np.sqrt(obs_var)
+            effective_counts[unmeasured] = n_eff
+        means[reps] = values
+        # No shrinkage for direct measurements: their observation variance has n_eff=1.
+        errors[reps] = np.sqrt(variance)
 
-    # (b) override measured rep leaves
-    for gid, phi_tasks in phi_per_task_map.items():
-        gid = int(gid)
-        if 0 <= gid < G:
-            leaf_is_measured[gid] = True
-            mu_leaf_per_task[gid] = dict(phi_tasks)
-            
-            # macro from per-task
-            if phi_tasks:
-                mu_leaf[gid] = float(np.mean(list(phi_tasks.values())))
-            
-            pid = int(parent_of_leaf[gid])
-            se_leaf[gid] = float(max(se_floor, se_parent[pid]))
-            se_leaf_per_task[gid] = {t: float(max(se_floor, se_parent[pid])) for t in task_names}
-
-    info: Dict[str, Any] = {
+    mu_leaf_per_task = {g: dict(zip(task_names, means[g].tolist())) for g in range(G)}
+    se_leaf_per_task = {g: dict(zip(task_names, errors[g].tolist())) for g in range(G)}
+    info = {
         "bootstrap": {
-            "mode": "parent_representative_independent_per_task",
-            "G_leaf": int(G),
-            "P_parent": int(P),
-            "n_tasks": int(n_tasks),
-            "task_names": task_names,
-            "rep_per_parent": int(rep_per_parent),
-            "rep_leaf_total": int(rep_leaf_gids.size),
-            "seed_int": int(seed_int),
+            "mode": "same_parent_cosine_interpolation_per_task",
+            "G_leaf": G, "P_parent": P, "n_tasks": len(task_names),
+            "task_names": task_names, "rep_per_parent": int(rep_per_parent),
+            "rep_leaf_total": int(rep_leaf_gids.size), "seed_int": int(seed_int),
             "v0_per_task": {str(k): float(v) for k, v in v0_per_task.items()},
-            "use_eb_shrinkage": bool(use_eb_shrinkage),
-            "prior_var": float(prior_var),
+            "use_eb_shrinkage": bool(use_eb_shrinkage), "prior_var": float(prior_var),
             "se_floor": float(se_floor),
+            "interpolation_temperature": float(interpolation_temperature),
         },
         "rep_leaf_gids": rep_leaf_gids.tolist(),
         "reps_per_parent": [arr.tolist() for arr in reps_per_parent],
-        "parent_mu": mu_parent.tolist(),
-        "parent_se": se_parent.tolist(),
-        "parent_r": r_parent.tolist(),
-        "phi_rep_map_macro": {str(k): float(v) for k, v in phi_rep_map_macro.items()},
-        "phi_per_task_map_summary": {
-            str(gid): {t: round(v, 6) for t, v in tasks.items()}
-            for gid, tasks in list(phi_per_task_map.items())[:20]
-        },
+        "global_measured_effect_mean": dict(zip(task_names, global_mean.tolist())),
+        "pooled_within_variance": dict(zip(task_names, pooled_variance.tolist())),
+        "within_variance_per_parent": {str(p): dict(zip(task_names, v.tolist()))
+                                       for p, v in within_variances.items()},
+        "leaf_n_eff": effective_counts.tolist(),
+        "leaf_is_measured": measured.tolist(),
     }
-    info["leaf_is_measured"] = leaf_is_measured.tolist()
-
-    return (
-        mu_leaf, se_leaf,
-        mu_leaf_per_task, se_leaf_per_task,
-        leaf_is_measured,
-        info,
-    )
-
-
-
+    # Macro summaries are averages of the per-domain estimates/SEs. The selector
+    # consumes the per-domain means above; no independent parent broadcast remains.
+    return (means.mean(axis=1), errors.mean(axis=1), mu_leaf_per_task,
+            se_leaf_per_task, measured, info)
 
 
 ########### find optimal k
@@ -2121,13 +1992,11 @@ def filter_active_tasks_and_weights(
       b_t: (n_active,) null scores for active tasks
     """
     G, n_tasks = phi_matrix.shape
-    phi_pos = np.maximum(phi_matrix, 0.0)
-
-    # max gain per task
-    max_gain = phi_pos.max(axis=0)  # (n_tasks,)
+    # Paper §3.3: retain domains with estimated gains OR harms.
+    max_effect = np.abs(phi_matrix).max(axis=0)  # (n_tasks,)
 
     # filter active tasks
-    active_mask = max_gain > epsilon_task
+    active_mask = max_effect > epsilon_task
     active_idx = np.where(active_mask)[0]
 
     if active_idx.size == 0:
@@ -2355,6 +2224,9 @@ def harp(
     use_eb_shrinkage: bool = True,
     prior_var: float = 0.01,
 
+    # λ in the paper's cosine kernel; 1.0 is an implementation default.
+    interpolation_temperature: float = 1.0,
+
     # --- Selection ---
     TOP_K_POINTS: int = 10000,           # point budget for the HARP-C / HARP-E cuts
     use_knee_stop: bool = True,
@@ -2410,6 +2282,11 @@ def harp(
         representatives_path: JSONL containing one base-model score (``acc01``)
             for every row in the same full validation set, with matching subject
             labels, used for the null scores ``b_d`` and the task grouping.
+        interpolation_temperature: strictly positive cosine-kernel λ. The paper
+            does not specify a numerical value; 1.0 is an implementation default.
+        prior_var: EB prior variance τ² (paper default 0.01).
+        epsilon_task: active-domain threshold; a domain is retained when any
+            estimated effect has magnitude strictly above this value.
         hierarchy_csv_path: where to dump cluster sizes (diagnostic; ``None`` to skip).
         checkpoint_dir: enable Stage-1b resume-on-preempt when set.
 
@@ -2427,6 +2304,7 @@ def harp(
         )
 
     _validate_validation_split(train_examples, eval_examples)
+    _validate_interpolation_config(interpolation_temperature, prior_var, se_floor)
 
     X_feat = l2_normalize_cuda_if_available(X_feat)
     n = int(X_feat.shape[0])
@@ -2498,6 +2376,7 @@ def harp(
         "parent_max_group_size": int(parent_max_group_size),
         "leaf_max_group_size": int(leaf_max_group_size),
         "rep_per_parent": int(rep_per_parent),
+        "interpolation_temperature": float(interpolation_temperature),
         "eval_metric": str(eval_metric),
         "validation_protocol": "full_fixed",
         "n_validation": int(len(eval_examples)),
@@ -2557,6 +2436,10 @@ def harp(
             validation_fingerprint=_validation_fingerprint(
                 gpu_pool.eval_arrays, subj_id_to_task, v0_per_task, eval_examples,
             ),
+            leaf_feat=leaf_feat, parent_of_leaf=parent_of_leaf,
+            rep_per_parent=rep_per_parent,
+            interpolation_temperature=interpolation_temperature,
+            use_eb_shrinkage=use_eb_shrinkage, prior_var=prior_var, se_floor=se_floor,
         )
         # Try CKPT-B first (covers the most ground); fall back to CKPT-A.
         _ckpt_b = _try_load_stage1b_ckpt(checkpoint_dir, "B", ckpt_key)
@@ -2592,6 +2475,7 @@ def harp(
                 se_floor=float(se_floor),
                 use_eb_shrinkage=bool(use_eb_shrinkage),
                 prior_var=float(prior_var),
+                interpolation_temperature=float(interpolation_temperature),
             )
             _save_stage1b_ckpt(checkpoint_dir, "A", ckpt_key, {
                 "mu_leaf": mu_leaf,

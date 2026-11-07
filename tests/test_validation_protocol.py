@@ -236,7 +236,12 @@ class ValidationProtocolTests(unittest.TestCase):
         ).hexdigest()[:16]
         fingerprint = s._validation_fingerprint(validation_arrays(),
             {0: "alpha", 1: "beta"}, {"alpha": 0.5, "beta": 0.5}, validation_examples())
-        current = s._stage1b_ckpt_key(**kwargs, validation_fingerprint=fingerprint)
+        current = s._stage1b_ckpt_key(
+            **kwargs, validation_fingerprint=fingerprint,
+            leaf_feat=np.ones((1, 2)), parent_of_leaf=np.array([0]),
+            rep_per_parent=3, interpolation_temperature=1.0,
+            use_eb_shrinkage=True, prior_var=0.01, se_floor=1e-3,
+        )
         self.assertNotEqual(legacy, current)
         with tempfile.TemporaryDirectory() as directory:
             payload = {"leaf_is_measured": np.array([True]), "mu_leaf": np.array([0.2])}

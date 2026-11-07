@@ -5,6 +5,16 @@ HARP builds a node–leaf hierarchy over the training pool, measures representat
 leaves, and infers the remaining utilities with empirical Bayes. **HARP-C** controls
 redundancy; **HARP-E** rewards complementary regions.
 
+Unmeasured leaves use only their parent's measured representatives, with
+`weights = softmax(cosine_similarity / interpolation_temperature)` and
+`n_eff = 1 / sum(weights**2)`. EB shrinks the weighted estimate using observation
+variance `within_parent_variance / n_eff`; measured effects stay unchanged.
+`interpolation_temperature=1.0` is an implementation default: the paper gives no
+numerical λ. `prior_var=0.01` follows the paper's prior-variance setting. Domain
+means pool all measured effects; single-representative parents use pooled
+within-parent variance (or `se_floor**2` if none is estimable). Domains with
+estimated gains or harms above `epsilon_task` in magnitude stay active.
+
 ![HARP workflow from paper Figure 1](docs/workflow.png)
 
 [Exact Figure 1 PDF](docs/workflow.pdf) · [Paper](https://arxiv.org/abs/2606.07690)
@@ -53,6 +63,8 @@ accepted, and no `eval_indices_<metric>.npy` is loaded. Regenerate old proxy-set
 baseline files on the full validation set. Legacy subset checkpoints are
 invalidated; new checkpoints fingerprint validation content, order, domains,
 and baseline scores. Training hierarchy and training-subset selection remain.
+Parent-broadcast checkpoints are also invalidated; the new key includes leaf
+embeddings, parent membership, and interpolation/EB settings.
 
 ## CPU checks
 
@@ -61,4 +73,5 @@ No model downloads or GPU jobs:
 ```bash
 python tests/test_smoke.py
 python -m unittest discover -s tests -p 'test_validation_protocol.py' -v
+python -m unittest discover -s tests -p 'test_interpolation.py' -v
 ```
