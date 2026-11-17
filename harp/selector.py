@@ -41,13 +41,15 @@ def _stage1b_ckpt_key(*, leaf_groups, bootstrap_seed_int, eval_metric,
                       base_model_name, n_train, n_eval, validation_fingerprint,
                       leaf_feat, parent_of_leaf, rep_per_parent,
                       interpolation_temperature, use_eb_shrinkage, prior_var,
-                      se_floor) -> str:
-    """Invalidate old parent-broadcast estimates and changed interpolation inputs."""
+                      se_floor, representative_strategy="farthest_first") -> str:
+    """Fingerprint representatives and estimates; reject pre-strategy caches."""
+    validate_representative_strategy(representative_strategy)
     metadata = {
-        "protocol": "full-validation-cosine-interpolation-v2",
+        "protocol": "full-validation-cosine-interpolation-representatives-v3",
         "seed": int(bootstrap_seed_int), "metric": str(eval_metric),
         "model": str(base_model_name), "n_train": int(n_train), "n_eval": int(n_eval),
         "validation": validation_fingerprint, "rep_per_parent": int(rep_per_parent),
+        "representative_strategy": representative_strategy,
         "interpolation_temperature": float(interpolation_temperature),
         "use_eb_shrinkage": bool(use_eb_shrinkage),
         "prior_var": float(prior_var), "se_floor": float(se_floor),
@@ -139,7 +141,11 @@ import tqdm
 from collections import defaultdict
 from dataclasses import dataclass
 
-from .knn_grouping import build_groups_from_shapley_ann, sample_representative_leaf_groups
+from .knn_grouping import (
+    build_groups_from_shapley_ann,
+    sample_representative_leaf_groups,
+    validate_representative_strategy,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -1232,6 +1238,7 @@ def bootstrap_parent_representative_independent_per_task(
     v0_per_task: Dict[str, float],
     subj_id_to_task: Dict[int, str],
     rep_per_parent: int = 2,
+    representative_strategy: str = "farthest_first",
     seed_int: int = 0,
     rng: np.random.Generator = np.random.default_rng(0),
     se_floor: float = 1e-3,
@@ -1253,7 +1260,10 @@ def bootstrap_parent_representative_independent_per_task(
     sample variance is floored at se_floor²; a single representative uses the
     pooled within-parent variance, or the floor when no variance is estimable.
     Directly measured leaves retain their observed effects without shrinkage.
+    Representative selection uses ``farthest_first`` by default; set
+    ``representative_strategy="kmeans_plus_plus"`` for the existing sampler.
     """
+    validate_representative_strategy(representative_strategy)
     _validate_interpolation_config(interpolation_temperature, prior_var, se_floor)
     leaf_feat = np.asarray(leaf_feat, dtype=np.float64)
     parent_of_leaf = np.asarray(parent_of_leaf, dtype=int)
@@ -1272,6 +1282,7 @@ def bootstrap_parent_representative_independent_per_task(
     reps_per_parent, rep_leaf_gids = sample_representative_leaf_groups(
         leaf_groups, leaf_feat, parent_of_leaf,
         rep_per_parent=int(rep_per_parent), rng=rng, use_diverse=True,
+        representative_strategy=representative_strategy,
     )
     phi_per_task_map = estimate_group_independent_phi_per_task_parallel(
         player_ids=rep_leaf_gids,
@@ -1349,6 +1360,7 @@ def bootstrap_parent_representative_independent_per_task(
             "mode": "same_parent_cosine_interpolation_per_task",
             "G_leaf": G, "P_parent": P, "n_tasks": len(task_names),
             "task_names": task_names, "rep_per_parent": int(rep_per_parent),
+            "representative_strategy": representative_strategy,
             "rep_leaf_total": int(rep_leaf_gids.size), "seed_int": int(seed_int),
             "v0_per_task": {str(k): float(v) for k, v in v0_per_task.items()},
             "use_eb_shrinkage": bool(use_eb_shrinkage), "prior_var": float(prior_var),
@@ -2218,6 +2230,7 @@ def harp(
 
     # --- Stage 1b: representative bootstrap + empirical-Bayes main effects ---
     rep_per_parent: int = 3,
+    representative_strategy: str = "farthest_first",
     bootstrap_seed_int: int = 0,
     v0: Optional[float] = None,
     se_floor: float = 1e-3,
@@ -2277,6 +2290,9 @@ def harp(
             validation row is scored for every measured model; final test data
             must not be supplied for selection.
         tokenizer: HF tokenizer for ``base_model_name``.
+        representative_strategy: within-size-region selection, ``farthest_first``
+            (default) or the existing ``kmeans_plus_plus`` sampler. Size-region
+            fitting, allocation, and ``rep_per_parent`` are unchanged.
         v0: base-model utility; if ``None`` it is read from ``representatives_path``.
         TOP_K_POINTS: point budget applied to both selections.
         representatives_path: JSONL containing one base-model score (``acc01``)
@@ -2295,6 +2311,7 @@ def harp(
         arrays) and ``.info`` (diagnostics).
     """
     lora_config = dict(lora_config or {})
+    validate_representative_strategy(representative_strategy)
 
     if X_feat is None or len(train_examples) == 0:
         return HarpResult(
@@ -2376,6 +2393,7 @@ def harp(
         "parent_max_group_size": int(parent_max_group_size),
         "leaf_max_group_size": int(leaf_max_group_size),
         "rep_per_parent": int(rep_per_parent),
+        "representative_strategy": representative_strategy,
         "interpolation_temperature": float(interpolation_temperature),
         "eval_metric": str(eval_metric),
         "validation_protocol": "full_fixed",
@@ -2438,6 +2456,7 @@ def harp(
             ),
             leaf_feat=leaf_feat, parent_of_leaf=parent_of_leaf,
             rep_per_parent=rep_per_parent,
+            representative_strategy=representative_strategy,
             interpolation_temperature=interpolation_temperature,
             use_eb_shrinkage=use_eb_shrinkage, prior_var=prior_var, se_floor=se_floor,
         )
@@ -2470,6 +2489,7 @@ def harp(
                 v0_per_task=v0_per_task,
                 subj_id_to_task=subj_id_to_task,
                 rep_per_parent=int(rep_per_parent),
+                representative_strategy=representative_strategy,
                 seed_int=int(bootstrap_seed_int),
                 rng=rng,
                 se_floor=float(se_floor),

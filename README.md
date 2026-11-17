@@ -40,12 +40,32 @@ result = harp(
     eval_examples=validation,       # complete fixed held-out validation set
     tokenizer=tokenizer,
     representatives_path="full_validation_baseline.jsonl",
+    representative_strategy="farthest_first",  # default; or "kmeans_plus_plus"
     eval_metric="accuracy",
     TOP_K_POINTS=10_000,
 )
 harp_c_indices = result.harp_c     # indices into train_examples only
 harp_e_indices = result.harp_e
 ```
+
+Within each parent, HARP fits adaptive 1D KMeans regions to raw leaf sizes
+using `n * log(RSS / n) + k * log(n)` and allocates `rep_per_parent=3`
+representatives across regions in proportion to their leaf counts. Within each
+region, `farthest_first` starts with a uniform random leaf, then repeatedly
+chooses the remaining leaf with the largest minimum squared Euclidean distance
+to the chosen normalized mean leaf embeddings. Ties use input order; duplicate
+and zero embeddings still yield unique leaves up to the requested count.
+Pass a seeded `rng=np.random.default_rng(seed)` for repeatable selection.
+
+Set `representative_strategy="kmeans_plus_plus"` to use the existing sampler,
+which draws subsequent representatives in proportion to their minimum squared
+distance. Both strategies are available in `harp(...)`, the standalone
+`bootstrap_parent_representative_independent_per_task(...)`, and
+`sample_representative_leaf_groups(...)`. In the latter,
+`use_diverse=False` takes precedence and retains uniform sampling. Size-region
+fitting, allocation, and representative budgets are unchanged; a single
+representative has the same selection and RNG behavior under either strategy.
+The selected strategy is recorded in result diagnostics.
 
 Every measured model is scored on **all supplied validation rows**, using the
 same domains and order throughout selection. Pass the official validation split
@@ -65,6 +85,9 @@ invalidated; new checkpoints fingerprint validation content, order, domains,
 and baseline scores. Training hierarchy and training-subset selection remain.
 Parent-broadcast checkpoints are also invalidated; the new key includes leaf
 embeddings, parent membership, and interpolation/EB settings.
+Pre-strategy checkpoints are invalidated for both options. New checkpoint keys
+include `representative_strategy`, so switching strategies reruns bootstrap
+instead of reusing another strategy's measurements.
 
 ## CPU checks
 
@@ -74,4 +97,5 @@ No model downloads or GPU jobs:
 python tests/test_smoke.py
 python -m unittest discover -s tests -p 'test_validation_protocol.py' -v
 python -m unittest discover -s tests -p 'test_interpolation.py' -v
+python -m unittest discover -s tests -p 'test_representatives.py' -v
 ```

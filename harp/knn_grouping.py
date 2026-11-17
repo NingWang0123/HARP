@@ -749,6 +749,67 @@ def _build_groups_on_subset_embed(
 # ============================================================
 # Diverse sampling utilities
 # ============================================================
+REPRESENTATIVE_STRATEGIES = ("farthest_first", "kmeans_plus_plus")
+
+
+def validate_representative_strategy(strategy: str) -> str:
+    """Reject unknown strategies before grouping, model loading, or cache reuse."""
+    if strategy not in REPRESENTATIVE_STRATEGIES:
+        raise ValueError(
+            f"representative_strategy must be one of {REPRESENTATIVE_STRATEGIES}; "
+            f"got {strategy!r}."
+        )
+    return strategy
+
+
+def diverse_sample_farthest_first(
+    X: np.ndarray,
+    k: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Select up to k unique rows by max-min squared Euclidean distance.
+
+    Rows are L2-normalized (zero vectors stay zero). The first index is uniform
+    under ``rng``; subsequent ties, including duplicate embeddings, use input
+    order. Selecting all rows returns input order without consuming randomness,
+    matching ``diverse_sample_kpp``'s budget convention.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    if X.ndim != 2 or not np.isfinite(X).all():
+        raise ValueError("Representative embeddings must be a finite 2D array.")
+    n = int(X.shape[0])
+    k = int(k)
+    if n == 0 or k <= 0:
+        return np.zeros((0,), dtype=int)
+    if X.shape[1] == 0:
+        raise ValueError("Representative embeddings need at least one feature.")
+    if k >= n:
+        return np.arange(n, dtype=int)
+
+    # Scale before normalizing to avoid overflow for large finite embeddings.
+    scale = np.max(np.abs(X), axis=1, keepdims=True)
+    X = X / np.where(scale > 0, scale, 1.0)
+    norm = np.linalg.norm(X, axis=1, keepdims=True)
+    X = X / np.where(norm > 0, norm, 1.0)
+
+    chosen = np.empty(k, dtype=int)
+    remaining = np.ones(n, dtype=bool)
+    chosen[0] = int(rng.integers(0, n))
+    remaining[chosen[0]] = False
+    diff = X - X[chosen[0]]
+    min_d2 = np.einsum("ij,ij->i", diff, diff)
+    for t in range(1, k):
+        candidates = np.flatnonzero(remaining)
+        nxt = int(candidates[np.argmax(min_d2[candidates])])
+        chosen[t] = nxt
+        remaining[nxt] = False
+        diff = X - X[nxt]
+        min_d2 = np.minimum(min_d2, np.einsum("ij,ij->i", diff, diff))
+    return chosen
+
+
 def diverse_sample_kpp(
     X: np.ndarray,
     k: int,
@@ -902,6 +963,7 @@ def sample_representative_leaf_groups(
     rep_per_parent: int = 3,
     rng: np.random.Generator,
     use_diverse: bool = True,
+    representative_strategy: str = "farthest_first",
 ) -> Tuple[List[np.ndarray], np.ndarray]:
     """
     Adaptive size-regions (<= reps) + embedding-diverse selection inside each region.
@@ -910,8 +972,14 @@ def sample_representative_leaf_groups(
       1) compute leaf sizes (RAW)
       2) choose number of size regions adaptively (1..min(rep_per_parent, unique sizes))
       3) allocate r reps across regions by *count* distribution (group-level)
-      4) within each region, pick embedding-diverse (KPP) among candidate leaves
+      4) within each region, pick embedding-diverse candidate leaves using
+         farthest-first (default) or the existing kmeans++ sampler.
+
+    ``use_diverse=False`` overrides the strategy with the existing uniform
+    sampling behavior. Strategies are still validated. Single-representative
+    regions and fully selected parents retain the existing RNG behavior.
     """
+    validate_representative_strategy(representative_strategy)
     group_feat = np.asarray(group_feat, dtype=np.float32)
     parent_of_group = np.asarray(parent_of_group, dtype=int)
 
@@ -988,7 +1056,10 @@ def sample_representative_leaf_groups(
                 continue
 
             if use_diverse and k_b > 1 and cand.size > k_b:
-                rel = diverse_sample_kpp(group_feat[cand], k_b, rng)
+                sampler = (diverse_sample_farthest_first
+                           if representative_strategy == "farthest_first"
+                           else diverse_sample_kpp)
+                rel = sampler(group_feat[cand], k_b, rng)
                 sel = cand[rel]
             else:
                 sel = rng.choice(cand, size=k_b, replace=False)
